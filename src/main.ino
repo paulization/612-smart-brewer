@@ -1,9 +1,9 @@
 // Libraries
 #include "Adafruit_ST7735.h" //LCD
 #include "Adafruit_MPR121.h" //proximity sensor
-#include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
+#include "MPU6050.h"
 #include "elapsedMillis.h"
+#include "math.h"
 
 // Gyroscope
 MPU6050 mpu;
@@ -22,76 +22,117 @@ Adafruit_ST7735 display = Adafruit_ST7735(CS, DC, RST);
 
 // Variables
 int temp = 20;
+int roll;
+int pitch;
+int water;
+int blink;
+int count = 3;
+int change = 0;
+int waterML = 0;
+int newWater = 0;
+bool alreadyStarted = false;
+bool alreadyReset = false;
 
 elapsedMillis timeElapsed;
-
-// MPU control/status vars
-bool dmpReady = false;  // set true if DMP init was successful
-uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
-uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
-uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount;     // count of all bytes currently in FIFO
-uint8_t fifoBuffer[64]; // FIFO storage buffer
-
-// orientation/motion vars
-Quaternion q;           // [w, x, y, z]         quaternion container
-VectorFloat gravity;    // [x, y, z]            gravity vector
-float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
-
-// ================================================================
-// ===               INTERRUPT DETECTION ROUTINE                ===
-// ================================================================
-
-volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
-void dmpDataReady() {
-    mpuInterrupt = true;
-}
 
 // Colors
 #define blackColor display.Color565(0, 0, 0)
 #define whiteColor display.Color565(255, 255, 255)
 #define redColor display.Color565(255, 0, 0)
 #define darkBlueColor display.Color565(0, 40, 122)
-int tempColor = display.Color565(0, 0, 255/2);
+int tempColor = display.Color565(0, 0, 128);
 
 // States
-enum kettle{NOTICE, HEAT, READY, POUR};
-kettle state = NOTICE;
+enum kettle{STANDBY, NOTICE, HEAT, READY, BLOOM, FIRSTPOUR, SECONDPOUR, END};
+kettle state = STANDBY;
 
 
 void setup() {
 
+  Wire.begin();
   Serial.begin(9600);
-  mpuInit();
   pinMode(buttonPin, INPUT);
   pinMode(speaker, OUTPUT);
   pinMode(proximityPin, INPUT);
   display.initR(INITR_GREENTAB);
   display.fillScreen(blackColor);
-  //display.setRotation(2);
+  display.setRotation(2);
 }
 
 void loop() {
   switch (state) {
+    case STANDBY:
+      display.setCursor(5, 100);
+      display.setTextSize(3);
+      display.print("STANDBY");
+      if (digitalRead(buttonPin) == HIGH) {
+        display.fillScreen(blackColor);
+        state = NOTICE;
+        delay(2000);
+      };
+    break;
+
     case NOTICE:
-    detectPresence();
+      detectPresence();
     break;
 
     case HEAT:
-    heating();
+      heating();
     break;
 
     case READY:
-    idle();
+      idle();
     break;
 
-    case POUR:
-    //elapsedTime();
-    //drawBloomingWater();
-    //drawSuggested();
-    trackRoll();
-    delay(1000);
-    mpu.resetFIFO();
+    case BLOOM:
+      countdown();
+      if (!alreadyStarted) {
+        timeElapsed = 0;
+        alreadyStarted = !alreadyStarted;
+      }
+      if (elapsedTime() >= 26) {
+        count = 3;
+        state = FIRSTPOUR;
+      }
+      drawEmpty(40);
+      drawPouringWater(trackRoll());
+      writeVolume();
+      drawSuggested(40, 0);
+      delay(1000);
+    break;
+
+    case FIRSTPOUR:
+      countdown(); //fine
+      resetPour();
+      if (elapsedTime() >= 86) {
+        count = 3;
+        alreadyReset = false;
+        state = SECONDPOUR;
+      }
+      drawEmpty(80); //fine
+      drawPouringWater(trackRoll()); //fine
+      writeVolume(); // fine
+      drawSuggested(80, 30); // fine
+      delay(1000);
+    break;
+
+    case SECONDPOUR:
+      countdown();
+      resetPour();
+      elapsedTime();
+      drawEmpty(80);
+      drawPouringWater(trackRoll());
+      writeVolume();
+      drawSuggested(80, 90);
+      delay(1000);
+      if (waterML >= 200 && trackRoll() <= 10 && timeElapsed >= 130000) {
+        state = END;
+      }
+    break;
+
+    case END:
+      writeEnd();
+      System.reset();
     break;
   }
 
@@ -101,29 +142,41 @@ void loop() {
 void detectPresence() {
   float reading = pulseIn(proximityPin, HIGH) / 147;
   Serial.println(reading);
-  if (reading < 25) {
+  if (reading < 10) {
     greeting();
     chime1();
-    delay(3500);
+    delay(5000);
+    fillingWater();
+    delay(5000); //change time later
     state = HEAT;
   }
 }
 
 void greeting() {
   display.fillScreen(darkBlueColor);
-  display.setCursor(30, 40);
   display.setTextWrap(true);
   display.setTextSize(3);
+  display.setCursor(30, 10);
   display.print("Good");
-  display.setCursor(5, 80);
+  display.setCursor(5, 50);
   display.print("Morning");
+  display.setCursor(10, 90);
+  display.print("Claire");
 }
 
 void chime1() {
   tone(speaker, 250, 500);
-  tone(speaker, 300, 200);
+  delay(501);
   tone(speaker, 450, 800);
-  delay(1501);
+  delay(801);
+}
+
+void fillingWater() {
+  display.fillScreen(darkBlueColor);
+  display.setTextWrap(true);
+  display.setTextSize(3);
+  display.setCursor(2, 50);
+  display.print("Filling...");
 }
 
 //--------------------- HEAT ------------------------//
@@ -135,12 +188,19 @@ void heating() {
   display.setCursor(7, 50);
   display.setTextSize(5);
   display.print(String(temp) + " C");
-  delay(100);
+  delay(100); //change time later
   temp++;
   if (temp > 93) {
-    delay(500);
+    chime2();
     state = READY;
   }
+}
+
+void chime2() {
+  tone(speaker, 550, 500);
+  delay(501);
+  tone(speaker, 450, 500);
+  delay(501);
 }
 
 //--------------------- READY ----------------------------//
@@ -150,13 +210,13 @@ void idle() {
   display.setTextSize(3);
   display.print("READY");
   if (digitalRead(buttonPin) == HIGH) {
-    timeElapsed = 0;
-    state = POUR;
+    mpu.initialize();
+    state = BLOOM;
   }
 }
 
 //--------------------- POUR ----------------------------//
-void elapsedTime() {
+int elapsedTime() {
   int timeElapsedSec = (timeElapsed / 1000) % 60;
   int timeElapsedMin = (timeElapsed / 1000) / 60;
   display.fillScreen(blackColor);
@@ -167,83 +227,80 @@ void elapsedTime() {
   } else {
     display.print("0" + String(timeElapsedMin) + ":" + String(timeElapsedSec));
   }
+  return timeElapsed / 1000;
+}
+
+void drawEmpty(int i) {
+  display.fillRect(15, 128 - i, 113, 200, whiteColor);
+}
+
+// must pour 2ml/sec
+void drawPouringWater(int r) {
+  newWater = max(0 , ((r - 20) / 3));
+  water = newWater + water;
+  display.fillRect(15, 128 - water, 113, 200, darkBlueColor);
+}
+
+void writeVolume() {
+  waterML = waterML + newWater;
   display.setCursor(35, 25);
   display.setTextSize(2);
-  display.print("100ml");
+  display.print(String(waterML) + "ml");
 }
 
-void drawBloomingWater() {
-  display.fillRect(0, 64, 64, 98, whiteColor);
-  display.fillRect(0, 64, 2 * timeElapsed / 1000, 98, darkBlueColor);
+void drawSuggested(int i, int j) { //must cover 80 pixel within 30 secs = 2.67 pixel
+  int timeElapsedSuggested = (timeElapsed / 1000) - j;
+  change = min(2.67 * timeElapsedSuggested, i);
+  display.fillTriangle(0, 120 - change, 0, 136 - change, 15, 128 - change, redColor);
+  display.fillRect(0, 127 - change, 128, 3, redColor);
 }
 
-void drawSuggested() {
-  display.fillTriangle(0 + 2 * timeElapsed / 1000, 54, 5 + 2 * timeElapsed / 1000, 64, 10 + 2 * timeElapsed / 1000, 54, redColor);
-}
-
-
-//------------------- MPU DMP6 functions-------------------//
-
-void mpuInit() {
-
-  Wire.setSpeed(CLOCK_SPEED_400KHZ);
-  Wire.begin();
-
-  mpu.initialize();
-
-  devStatus = mpu.dmpInitialize();
-
-  // supply your own gyro offsets here, scaled for min sensitivity
-  mpu.setXGyroOffset(68);
-  mpu.setYGyroOffset(41);
-  mpu.setZGyroOffset(19);
-  mpu.setZAccelOffset(1614);
-
-  // make sure it worked (returns 0 if so)
-  if (devStatus == 0) {
-      // turn on the DMP, now that it's ready
-      mpu.setDMPEnabled(true);
-
-      attachInterrupt(D2, dmpDataReady, RISING);
-
-      // set our DMP Ready flag so the main loop() function knows it's okay to use it
-      dmpReady = true;
-
-      // get expected DMP packet size for later comparison
-      packetSize = mpu.dmpGetFIFOPacketSize();
+void countdown() {
+  while (count > 0) {
+    display.fillScreen(blackColor);
+    display.setCursor(40, 40);
+    display.setTextSize(7);
+    display.print(count);
+    tone(speaker, 350, 300);
+    count--;
+    delay(1000);
   }
 }
 
-int trackRoll() {
-  mpuInterrupt = false;
-  mpuIntStatus = mpu.getIntStatus();
-
-  // get current FIFO count
-  fifoCount = mpu.getFIFOCount();
-
-  // check for overflow (this should never happen unless our code is too inefficient)
-  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
-      // reset so we can continue cleanly
-      mpu.resetFIFO();
-      Serial.println(F("FIFO overflow!"));
-
-  // otherwise, check for DMP data ready interrupt (this should happen frequently)
-  } else if ((mpuIntStatus & 0x02) > 0) {
-      // wait for correct available data length, should be a VERY short wait
-      while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-
-      // read a packet from FIFO
-      mpu.getFIFOBytes(fifoBuffer, packetSize);
-
-      // track FIFO count here in case there is > 1 packet available
-      // (this lets us immediately read more without waiting for an interrupt)
-      fifoCount -= packetSize;
-
-      mpu.dmpGetQuaternion(&q, fifoBuffer);
-      mpu.dmpGetGravity(&gravity, &q);
-      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-      Serial.print("ROLL\t");
-      Serial.println(ypr[2] * 180/M_PI);
-      return ypr[2] * 180/M_PI;
+void resetPour() {
+  if (!alreadyReset) {
+    water = 0;
+    alreadyReset = !alreadyReset;
   }
+}
+
+
+//------------------- END -------------------//
+
+void writeEnd() {
+  display.fillScreen(blackColor);
+  display.setTextWrap(true);
+  display.setTextSize(3);
+  display.setCursor(35, 30);
+  display.print("Bye");
+  display.setCursor(15, 70);
+  display.print("Claire");
+  delay(1000);
+}
+
+
+//------------------- MPU functions-------------------//
+int trackRoll(){
+  double x_Buff = mpu.getAccelerationX();
+  double y_Buff = mpu.getAccelerationY();
+  double z_Buff = mpu.getAccelerationZ();
+  roll = atan2(y_Buff , z_Buff) * 57.3;
+  pitch = atan2((- x_Buff) , sqrt(y_Buff * y_Buff + z_Buff * z_Buff)) * 57.3;
+  if (roll > 90) {
+    roll = 0;
+  } else if (roll < 0) {
+    roll = roll + 180;
+  }
+  Serial.println(roll);
+  return roll;
 }
